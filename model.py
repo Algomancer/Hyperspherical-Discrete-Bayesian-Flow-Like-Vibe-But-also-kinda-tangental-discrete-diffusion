@@ -310,6 +310,87 @@ class FeedForward(Module):
         hidden = F.silu(gate) * hidden
         return self.to_out(hidden)
 
+class SinusoidalTimeEmbedding(Module):
+    """Fourier features for time embedding"""
+    def __init__(self, dim):
+        super().__init__()
+        assert dim % 2 == 0 # dim must be even
+        self.dim = dim
+        half_dim = dim // 2
+        # From DiT/VDM - timestep embedding
+        freqs = torch.exp(
+            -math.log(10000) * torch.arange(start=0, end=half_dim, dtype=torch.float32) / half_dim
+        )
+        self.register_buffer('freqs', freqs)
+
+    def forward(self, t):
+        # t: (B, 1)
+        t_proj = t * self.freqs[None] * 2 * math.pi
+        return torch.cat([t_proj.sin(), t_proj.cos()], dim=-1)
+
+class TimestepEmbedder(Module):
+    """Time embedding with Fourier features followed by MLP"""
+    def __init__(self, dim, model_dim):
+        super().__init__()
+        self.fourier = SinusoidalTimeEmbedding(dim)
+        # MLP to get conditioning vectors for AdaLN
+        self.mlp = nn.Sequential(
+            NormLinear(dim, dim * 2),
+            nn.SiLU(),
+            NormLinear(dim * 2, model_dim)
+        )
+
+    def forward(self, t):
+        # t: (B, 1)
+        t_fourier = self.fourier(t)
+        return self.mlp(t_fourier)
+
+class DiTBlock(Module):
+    def __init__(self, dim, num_heads, mlp_ratio=4, manual_norm_weights=False, norm_eps=0.0, num_hyperspheres=1):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim, elementwise_affine=False)
+        self.norm2 = nn.LayerNorm(dim, elementwise_affine=False)
+
+        self.attn = Attention(dim, heads=num_heads, manual_norm_weights=manual_norm_weights,
+                            norm_eps=norm_eps, num_hyperspheres=num_hyperspheres)
+        self.ff = FeedForward(dim, expand_factor=mlp_ratio, manual_norm_weights=manual_norm_weights,
+                           norm_eps=norm_eps, num_hyperspheres=num_hyperspheres)
+
+        # Zero-init modulation params using NormLinear
+        self.modulation = NormLinear(
+            dim,  # input dim from time embedding
+            dim * 6,  # output dim for shift/scale/gate
+            norm_dim_in=True,
+            parametrize=not manual_norm_weights,
+            norm_eps=norm_eps,
+            groups=num_hyperspheres
+        )
+
+        # Zero init the weights while respecting hyperspherical constraints
+        with torch.no_grad():
+            # Initialize to zeros then normalize to maintain unit norm
+            self.modulation.linear.weight.zero_()
+            self.modulation.norm_weights_()
+
+    def forward(self, x, c):
+        # Get modulation params (now properly normalized)
+        modulation = self.modulation(c)
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = torch.chunk(
+            modulation, 6, dim=-1
+        )
+
+        # Attention block with AdaLN
+        x_norm = self.norm1(x)
+        x_attn = x_norm * (1 + scale_msa[:, None]) + shift_msa[:, None]
+        x = x + gate_msa[:, None] * self.attn(x_attn)
+
+        # FF block with AdaLN
+        x_norm = self.norm2(x)
+        x_ff = x_norm * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
+        x = x + gate_mlp[:, None] * self.ff(x_ff)
+
+        return x
+
 
 class nSFM(Module):
     def __init__(
@@ -368,7 +449,8 @@ class nSFM(Module):
         )
         self.l2norm = partial(l2norm, norm_eps=norm_eps, groups=num_hyperspheres)
         self.token_embed = NormLinear_(dim, num_tokens)
-        self.time_embed = NormLinear_(1, dim)
+
+        self.time_embed = TimestepEmbedder(256, dim)
         self.rotary_embed = RotaryEmbedding(dim_head)
 
         # Set default alpha init
@@ -392,44 +474,13 @@ class nSFM(Module):
         # Build transformer layers
         self.layers = ModuleList()
         for hparams in zip(*scale_hparams):
-            attn = Attention(
-                dim,
-                dim_head=dim_head,
-                heads=heads,
-                causal=causal,
-                norm_qk=attn_norm_qk,
-                manual_norm_weights=manual_norm_weights,
-                s_qk_init=hparams[4],
-                s_qk_scale=hparams[5],
-                flash_kwargs=attn_flash_kwargs,
-                norm_eps=norm_eps,
-                num_hyperspheres=num_hyperspheres,
-            )
 
-            ff = FeedForward(
-                dim,
-                expand_factor=ff_expand_factor,
-                manual_norm_weights=manual_norm_weights,
-                s_hidden_init=hparams[6],
-                s_hidden_scale=hparams[7],
-                s_gate_init=hparams[8],
-                s_gate_scale=hparams[9],
-                norm_eps=norm_eps,
-                num_hyperspheres=num_hyperspheres,
+            dit_block = DiTBlock(
+                dim=dim,
+                num_heads=heads,
+                mlp_ratio=ff_expand_factor
             )
-
-            attn_residual = Residual(
-                attn,
-                dim,
-                default(hparams[0], alpha_init),
-                default(hparams[1], dim**-0.5),
-            )
-
-            ff_residual = Residual(
-                ff, dim, default(hparams[2], alpha_init), default(hparams[3], dim**-0.5)
-            )
-
-            self.layers.append(ModuleList([attn_residual, ff_residual]))
+            self.layers.append(dit_block)
 
         # Output layers
         self.to_logits = None if tied_embedding else NormLinear_(dim, num_tokens)
@@ -437,12 +488,12 @@ class nSFM(Module):
             num_tokens, s_logit_init, default(s_logit_scale, dim**-0.5)
         )
 
-    def _process_tokens(self, tokens, t, t_embed, beta_t):
+    def _process_tokens(self, tokens, t, beta_t):
         """Apply noise and normalization to tokens"""
         noise = torch.randn_like(tokens)
         noise = noise - (noise * tokens).sum(dim=-1, keepdim=True) * tokens
         tokens = self.l2norm(tokens + beta_t[:, None] * noise)
-        return torch.cat([t_embed, tokens], dim=1)
+        return tokens#torch.cat([], dim=1)
 
     def _get_logits(self, tokens, token_embed):
         """Convert tokens to logits"""
@@ -466,25 +517,17 @@ class nSFM(Module):
             t = torch.rand(
                 (tokens.size(0), 1), device=tokens.device, dtype=tokens.dtype
             )
-            t_embed = self.time_embed(t).unsqueeze(1)
+            t_embed = self.time_embed(t)#.unsqueeze(1)
             beta_t = self.beta * (t**2)
 
-            tokens = self._process_tokens(tokens, t, t_embed, beta_t)
+            tokens = self._process_tokens(tokens, t, beta_t)
             first_values = None
 
-            for attn, ff in self.layers:
-                tokens, values = attn(
-                    tokens,
-                    causal=False,
-                    mask=mask,
-                    rotary_embed=rotary_embed,
-                    return_values=True,
-                    value_residual=first_values if self.add_value_residual else None,
-                )
-                first_values = default(first_values, values)
-                tokens = ff(tokens)
+            for block in self.layers:
+                tokens = block(tokens, t_embed)
 
-            tokens = tokens[:, 1:, :]
+
+            tokens = tokens[:, :, :]
             logits = self._get_logits(tokens, token_embed)
 
             if not return_loss:
@@ -522,22 +565,15 @@ class nSFM(Module):
             t = torch.full(
                 (batch_size, 1), (nb_steps - i) / nb_steps, device=device, dtype=dtype
             )
-            t_embed = self.time_embed(t).unsqueeze(1)
+            t_embed = self.time_embed(t)#.unsqueeze(1)
 
-            x = torch.cat([t_embed, tokens], dim=1)
+            x = tokens#torch.cat([t_embed, ], dim=1)
             first_values = None
 
-            for attn, ff in self.layers:
-                x, values = attn(
-                    x,
-                    rotary_embed=self.rotary_embed,
-                    return_values=True,
-                    value_residual=first_values if self.add_value_residual else None,
-                )
-                first_values = default(first_values, values)
-                x = ff(x)
+            for block in self.layers:
+                x = block(x, t_embed)
 
-            x = x[:, 1:, :]
+            x = x[:, :, :]
             logits = self._get_logits(x, token_embed) / temperature
 
             if top_k > 0:
@@ -552,7 +588,7 @@ class nSFM(Module):
 
             if i < nb_steps:
                 beta_t = self.beta * (t**2)
-                tokens = self._process_tokens(tokens, t, t_embed, beta_t)[:, 1:]
+                tokens = self._process_tokens(tokens, t, beta_t)[:, :]
 
         similarities = einsum(tokens, token_embed, "b n d, k d -> b n k")
         return similarities.argmax(dim=-1)
